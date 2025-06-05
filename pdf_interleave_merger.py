@@ -9,20 +9,99 @@ PDF交替合并工具
 
 import PyPDF2
 import os
+import sys
 import time
 import re
 from pathlib import Path
 from tqdm import tqdm
 
+# 设置Poppler路径
+def setup_poppler_path():
+    """自动设置Poppler路径"""
+    if getattr(sys, 'frozen', False):
+        # 如果是打包后的exe
+        current_dir = Path(sys._MEIPASS)
+    else:
+        # 如果是开发环境
+        current_dir = Path(__file__).parent
+    
+    poppler_paths = [
+        current_dir / "poppler" / "poppler-24.08.0" / "Library" / "bin",
+        current_dir / "poppler" / "bin",
+        Path("C:/poppler/bin"),
+        Path("C:/Program Files/poppler/bin"),
+    ]
+    
+    for poppler_path in poppler_paths:
+        if poppler_path.exists():
+            poppler_str = str(poppler_path.absolute())
+            current_path = os.environ.get('PATH', '')
+            if poppler_str not in current_path:
+                os.environ['PATH'] = poppler_str + os.pathsep + current_path
+                print(f"🔧 已设置Poppler路径: {poppler_str}")
+            return True
+    
+    print("⚠️ 未找到Poppler，OCR功能可能不可用")
+    return False
+
+# 在导入OCR库之前设置Poppler路径
+setup_poppler_path()
+
 # OCR相关导入
 try:
     import pytesseract
     from pdf2image import convert_from_path
+    
+    # 设置Tesseract路径和语言包路径
+    if getattr(sys, 'frozen', False):
+        # 如果是打包后的exe
+        current_dir = Path(sys._MEIPASS)
+        tesseract_exe = current_dir / "tesseract" / "tesseract.exe"
+        tessdata_dir = current_dir / "tesseract" / "tessdata"
+    else:
+        # 如果是开发环境
+        current_dir = Path(__file__).parent
+        tesseract_exe = None
+        tessdata_dir = current_dir / "tesseract" / "tessdata"
+    
+    # 设置TESSDATA_PREFIX环境变量
+    if tessdata_dir.exists():
+        os.environ['TESSDATA_PREFIX'] = str(tessdata_dir)
+        print(f"🔧 设置TESSDATA_PREFIX: {tessdata_dir}")
+    
+    tesseract_paths = []
+    if tesseract_exe and tesseract_exe.exists():
+        tesseract_paths.append(str(tesseract_exe))
+    tesseract_paths.extend([
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Tesseract-OCR\tesseract.exe",
+        "tesseract"  # 如果已在PATH中
+    ])
+    
+    tesseract_found = False
+    for path in tesseract_paths:
+        try:
+            pytesseract.pytesseract.tesseract_cmd = path
+            # 测试是否可以运行
+            pytesseract.get_tesseract_version()
+            tesseract_found = True
+            print(f"✅ 找到Tesseract: {path}")
+            break
+        except:
+            continue
+    
+    if not tesseract_found:
+        raise ImportError("Tesseract not found")
+    
     OCR_AVAILABLE = True
+    print("✅ OCR功能已启用")
 except ImportError:
     OCR_AVAILABLE = False
-    msg = "⚠️  OCR功能不可用，需要安装: pip install pytesseract pdf2image Pillow"
+    msg = "❌ OCR功能不可用，需要安装: pip install pytesseract pdf2image Pillow"
     print(msg)
+    print("❌ 或者需要安装Tesseract OCR引擎")
+    print("❌ 程序要求必须有OCR功能，现在退出...")
+    exit(1)
 
 
 def extract_text_with_ocr(pdf_path, page_num=0):
@@ -37,7 +116,8 @@ def extract_text_with_ocr(pdf_path, page_num=0):
         str: 提取的文字，失败返回None
     """
     if not OCR_AVAILABLE:
-        return None
+        print("❌ OCR功能不可用，程序退出")
+        exit(1)
     
     try:
         print(f"  🔍 使用OCR提取第{page_num + 1}页文字...")
@@ -50,13 +130,23 @@ def extract_text_with_ocr(pdf_path, page_num=0):
             # 使用OCR提取文字
             text = pytesseract.image_to_string(images[0], lang='chi_sim+eng')
             print(f"  📝 OCR提取文字长度: {len(text)} 字符")
+            # 显示提取的文字内容（用于调试）
+            if text.strip():
+                print(f"  📄 OCR提取的文字内容:")
+                print(f"  {repr(text[:500])}")  # 显示前500个字符
             return text
         else:
             print("  ❌ 无法转换PDF页面为图像")
             return None
             
     except Exception as e:
-        print(f"  ❌ OCR提取失败: {e}")
+        error_msg = str(e)
+        print(f"  ❌ OCR提取失败: {error_msg}")
+        # 如果是tesseract相关错误，直接退出程序
+        if "tesseract" in error_msg.lower():
+            print("❌ Tesseract OCR引擎未安装或未配置，程序退出")
+            print("❌ 请安装Tesseract OCR: https://github.com/tesseract-ocr/tesseract")
+            exit(1)
         return None
 
 
@@ -79,12 +169,22 @@ def extract_applicant_name(pdf_reader, pdf_path):
             text = page.extract_text()
             if text and text.strip():
                 # 使用正则表达式查找"申请人："和"，"之间的文字
-                pattern = r'申请人：([^，]+)，'
-                match = re.search(pattern, text)
-                if match:
-                    applicant_name = match.group(1).strip()
-                    print(f"  📝 在第{page_num + 1}页找到申请人: {applicant_name}")
-                    return applicant_name
+                patterns = [
+                    r'申请人：([^，]+)，',
+                    r'申请人:([^，]+)，',
+                    r'申请人：([^,]+),',
+                    r'申请人:([^,]+),',
+                    r'申\s*请\s*人\s*[:：]\s*([^，,\s]+)',  # 处理空格和变体
+                    r'申\s*请\s*人\s*[:：]\s*([^，,]+?)\s*[，,]',  # 更宽松的匹配
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, text)
+                    if match:
+                        applicant_name = match.group(1).strip()
+                        # 去掉姓名中的空格
+                        applicant_name = re.sub(r'\s+', '', applicant_name)
+                        print(f"  📝 在第{page_num + 1}页找到申请人: {applicant_name}")
+                        return applicant_name
         
         print("  ⚠️  直接文本提取未找到申请人信息")
         
@@ -99,17 +199,25 @@ def extract_applicant_name(pdf_reader, pdf_path):
                         r'申请人：([^，]+)，',
                         r'申请人:([^，]+)，',
                         r'申请人：([^,]+),',
-                        r'申请人:([^,]+),'
+                        r'申请人:([^,]+),',
+                        r'申\s*请\s*人\s*[:：]\s*([^，,男女]+?)\s*[，,男女]',  # 匹配到逗号或性别字符
+                        r'申\s*请\s*人\s*[:：]\s*([^\s，,]+(?:\s+[^\s，,]+)*?)\s*[，,男女]',  # 处理姓名中的空格
+                        r'申\s*请\s*人\s*[:：]\s*([^，,\n]+?)\s*[，,]',  # 更宽松的匹配
                     ]
                     
                     for pattern in patterns:
                         match = re.search(pattern, ocr_text)
                         if match:
                             applicant_name = match.group(1).strip()
+                            # 去掉姓名中的空格
+                            applicant_name = re.sub(r'\s+', '', applicant_name)
                             print(f"  📝 OCR在第{page_num + 1}页找到申请人: {applicant_name}")
                             return applicant_name
             
             print("  ⚠️  OCR也未找到申请人信息")
+        else:
+            print("❌ OCR功能不可用，程序退出")
+            exit(1)
         
         print(f"  ❌ 在 {os.path.basename(pdf_path)} 中未找到申请人信息")
         return None
@@ -172,30 +280,52 @@ def merge_pdfs_by_page_groups(pdf_paths, output_dir):
                 
                 if text and text.strip():
                     print("  📖 尝试直接文本提取...")
-                    pattern = r'申请人：([^，]+)，'
-                    match = re.search(pattern, text)
-                    if match:
-                        applicant_name = match.group(1).strip()
-                        print(f"  📝 找到申请人: {applicant_name}")
+                    patterns = [
+                        r'申请人：([^，]+)，',
+                        r'申请人:([^，]+)，',
+                        r'申请人：([^,]+),',
+                        r'申请人:([^,]+),',
+                        r'申\s*请\s*人\s*[:：]\s*([^，,男女]+?)\s*[，,男女]',  # 匹配到逗号或性别字符
+                        r'申\s*请\s*人\s*[:：]\s*([^\s，,]+(?:\s+[^\s，,]+)*?)\s*[，,男女]',  # 处理姓名中的空格
+                        r'申\s*请\s*人\s*[:：]\s*([^，,\n]+?)\s*[，,]',  # 更宽松的匹配
+                    ]
+                    applicant_name = None
+                    for pattern in patterns:
+                        match = re.search(pattern, text)
+                        if match:
+                            applicant_name = match.group(1).strip()
+                            # 去掉姓名中的空格
+                            applicant_name = re.sub(r'\s+', '', applicant_name)
+                            print(f"  📝 找到申请人: {applicant_name}")
+                            break
                 
                 # 方法2：OCR提取（如果直接提取失败）
-                if not applicant_name and OCR_AVAILABLE:
-                    print("  🔍 尝试OCR文本提取...")
-                    ocr_text = extract_text_with_ocr(third_path, page_num)
-                    if ocr_text:
-                        patterns = [
-                            r'申请人：([^，]+)，',
-                            r'申请人:([^，]+)，',
-                            r'申请人：([^,]+),',
-                            r'申请人:([^,]+),'
-                        ]
-                        
-                        for pattern in patterns:
-                            match = re.search(pattern, ocr_text)
-                            if match:
-                                applicant_name = match.group(1).strip()
-                                print(f"  📝 OCR找到申请人: {applicant_name}")
-                                break
+                if not applicant_name:
+                    if OCR_AVAILABLE:
+                        print("  🔍 尝试OCR文本提取...")
+                        ocr_text = extract_text_with_ocr(third_path, page_num)
+                        if ocr_text:
+                            patterns = [
+                                r'申请人：([^，]+)，',
+                                r'申请人:([^，]+)，',
+                                r'申请人：([^,]+),',
+                                r'申请人:([^,]+),',
+                                r'申\s*请\s*人\s*[:：]\s*([^，,男女]+?)\s*[，,男女]',  # 匹配到逗号或性别字符
+                                r'申\s*请\s*人\s*[:：]\s*([^\s，,]+(?:\s+[^\s，,]+)*?)\s*[，,男女]',  # 处理姓名中的空格
+                                r'申\s*请\s*人\s*[:：]\s*([^，,\n]+?)\s*[，,]',  # 更宽松的匹配
+                            ]
+                            
+                            for pattern in patterns:
+                                match = re.search(pattern, ocr_text)
+                                if match:
+                                    applicant_name = match.group(1).strip()
+                                    # 去掉姓名中的空格
+                                    applicant_name = re.sub(r'\s+', '', applicant_name)
+                                    print(f"  📝 OCR找到申请人: {applicant_name}")
+                                    break
+                    else:
+                        print("❌ OCR功能不可用，程序退出")
+                        exit(1)
                 
                 page_applicant_names.append(applicant_name)
                 
@@ -291,21 +421,35 @@ def merge_pdfs_by_page_groups(pdf_paths, output_dir):
 
 def main():
     """主函数"""
-    print("🔥 PDF分页合并工具 (支持OCR)")
+    print("🔥 PDF分页合并工具 (需要OCR)")
     print("=" * 50)
     print("📝 功能：将多个PDF按页面生成独立的合并文件")
     print("💡 文件命名：使用第三个PDF中申请人姓名命名")
     if OCR_AVAILABLE:
         print("🔍 OCR功能：已启用，支持扫描版PDF文字提取")
     else:
-        print("⚠️  OCR功能：未启用，只能处理可编辑文本的PDF")
+        print("❌ OCR功能：未启用，程序无法运行")
+        print("❌ 请安装OCR依赖: pip install pytesseract pdf2image Pillow")
+        print("❌ 程序退出")
+        exit(1)
     print("=" * 50)
     
     # 记录程序开始时间
     program_start_time = time.time()
     
-    # 默认使用当前目录的PDF文件
-    current_dir = Path(__file__).parent
+    # 获取正确的工作目录
+    if getattr(sys, 'frozen', False):
+        # 如果是打包后的exe，使用exe文件所在目录的上级目录（项目根目录）
+        exe_dir = Path(sys.executable).parent
+        if exe_dir.name == 'dist':
+            # 如果exe在dist目录中，使用dist的上级目录
+            current_dir = exe_dir.parent
+        else:
+            # 如果exe直接在项目根目录，使用exe所在目录
+            current_dir = exe_dir
+    else:
+        # 如果是开发环境，使用脚本文件所在目录
+        current_dir = Path(__file__).parent
     
     # 设置正确的路径：原始文件在子目录PDF插入下
     pdf_dir = current_dir / "PDF插入" / "原始文件"
